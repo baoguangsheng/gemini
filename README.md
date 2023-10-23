@@ -26,3 +26,13 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 bash scripts_sum/run-bart-large.sh exp_root cnndm
 ```
 CUDA_VISIBLE_DEVICES=0 bash scripts_sum/test-rewriter.sh cnndm exp_root
 ```
+
+### Citation
+If you find this work useful, you can cite it with the following BibTex entry:
+
+    @article{bao2023gemini,
+      title={GEMINI: Controlling the Sentence-level Writing Style for Abstractive Text Summarization},
+      author={Bao, Guangsheng and Ou, Zebin and Zhang, Yue},
+      journal={arXiv preprint arXiv:2304.03548},
+      year={2023}
+    }
