@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+import random
 from typing import Dict, List, Optional
 
 import torch
@@ -25,6 +26,8 @@ class SequenceGenerator(nn.Module):
         max_len_b=200,
         min_len=1,
         normalize_scores=True,
+        oracle_ext='none',  # none, len, mode, ext, rwt, abs, rand
+        abs_penalty=1.0, # <1.0 produce more abs mode, >1.0 produce less abs mode
         len_penalty=1.0,
         unk_penalty=0.0,
         temperature=1.0,
@@ -67,6 +70,7 @@ class SequenceGenerator(nn.Module):
         self.pad = tgt_dict.pad()
         self.unk = tgt_dict.unk()
         self.eos = tgt_dict.eos() if eos is None else eos
+        self.abs = tgt_dict.index('<S>')
         self.symbols_to_strip_from_output = (
             symbols_to_strip_from_output.union({self.eos})
             if symbols_to_strip_from_output is not None
@@ -81,6 +85,8 @@ class SequenceGenerator(nn.Module):
         self.min_len = min_len
 
         self.normalize_scores = normalize_scores
+        self.oracle_ext = oracle_ext
+        self.abs_penalty = math.log(abs_penalty)
         self.len_penalty = len_penalty
         self.unk_penalty = unk_penalty
         self.temperature = temperature
@@ -190,6 +196,11 @@ class SequenceGenerator(nn.Module):
                 for i in range(self.model.models_size)
             ],
         )
+
+        oracle_reserve_len = 0
+        if self.oracle_ext != 'none':
+            oracle_reserve_len = 30
+            oracle_exts = sample["oracle_exts"]
         net_input = sample["net_input"]
 
         if "src_tokens" in net_input:
@@ -248,13 +259,97 @@ class SequenceGenerator(nn.Module):
             torch.zeros(bsz * beam_size, max_len + 1).to(src_tokens).float()
         )  # +1 for eos; pad is never chosen for scoring
         tokens = (
-            torch.zeros(bsz * beam_size, max_len + 2)
+            torch.zeros(bsz * beam_size, max_len + 2 + oracle_reserve_len)
             .to(src_tokens)
             .long()
             .fill_(self.pad)
         )  # +2 for eos and pad
         tokens[:, 0] = self.eos if bos_token is None else bos_token
         attn: Optional[Tensor] = None
+
+        # Guangsheng Bao: for oracle template
+        tok_end = self.tgt_dict.index('</S>')
+        tok_abs = self.tgt_dict.index('<S>')
+        tok_ext1 = self.tgt_dict.index('<S1>')
+        tok_ext120 = self.tgt_dict.index('<S120>')
+
+        # initialize the decoding frame-template.
+        # oralce-len: </S> </S> </S>
+        # oracle-mode: <S120> <S120> <S>
+        # oracle-ext: <S5> <S3> <S>
+        def _fill_frame(toks, oracle_exts):
+            def _docframe(ext, mode):
+                if mode == 'len':
+                    return [tok_end for idx in ext][:oracle_reserve_len]
+                elif mode == 'mode':
+                    return [tok_abs if idx == -1 else tok_ext120 for idx in ext][:oracle_reserve_len]
+                elif mode == 'ext':
+                    return [tok_abs if idx == -1 else self.tgt_dict.index(f'<S{idx + 1}>') for idx in ext][:oracle_reserve_len]
+                elif mode == 'rand':
+                    return [tok_abs if random.random() > 0.5 else tok_ext120 for _ in range(oracle_reserve_len)]
+                elif mode == 'rwt':
+                    return [tok_ext120 for _ in range(oracle_reserve_len)]
+                elif mode == 'abs':
+                    return [tok_abs for _ in range(oracle_reserve_len)]
+                else:
+                    raise Exception
+
+            toklen = toks.size(1)
+            bsz = len(oracle_exts)
+            assert bsz * beam_size == len(toks)
+            for i in range(bsz):
+                docfrm = _docframe(oracle_exts[i], self.oracle_ext)
+                toks[i * beam_size:(i + 1) * beam_size, -1] = toklen - len(docfrm) - 1
+                toks[i * beam_size:(i + 1) * beam_size, toklen - len(docfrm) - 1:toklen - 1] = torch.LongTensor(docfrm).unsqueeze(0).to(toks)
+
+        # filter out undesired tokens for current step according to the frame-template
+        def _filter_frame(probs, toks, step):
+            if step >= max_len - 2:
+                return
+            exp_idx = toks[:,  -1:]
+            exp_token = toks.gather(1, exp_idx)
+            cur_token = toks[:, step]
+            # mask unexpected tokens
+            disable_eos = self.oracle_ext in ['len', 'mode', 'ext']
+            for i in range(len(cur_token)):
+                ctok = cur_token[i]
+                if ctok in [self.eos, tok_end]: # next token is a frame token
+                    etok = exp_token[i]
+                    if etok == tok_end: # oracle-len
+                        if disable_eos:
+                            probs[i, self.eos] = -math.inf
+                    elif etok == tok_abs:  # oracle-mode or oracle-ext: abs mode
+                        probs[i, tok_ext1:tok_ext120 + 1] = -math.inf
+                    elif etok == tok_ext120:  # oracle-mode: ext mode
+                        probs[i, tok_abs] = -math.inf
+                        if disable_eos:
+                            probs[i, self.eos] = -math.inf
+                    elif tok_ext1 <= etok < tok_ext120:  # oracle-ext: specific ext
+                        probs[i, etok] = 0
+                    else:  # end of the template
+                        probs[i, self.eos] = 0
+
+        # update the frame-template according to current token
+        def _update_frame(toks, step):
+            exp_idx = toks[:,  -1:]
+            exp_token = toks.gather(1, exp_idx).squeeze(-1)
+            cur_token = toks[:, step]
+            for i in range(len(cur_token)):
+                ctok = cur_token[i]
+                etok = exp_token[i]
+                # oracle-len
+                # oracle-mode or oracle-ext: abs mode
+                # oracle-mode: ext mode
+                # oracle-ext: specific ext
+                if (etok == tok_end and tok_abs <= ctok <= tok_ext120) \
+                    or (etok == tok_abs and ctok == tok_abs) \
+                    or (etok == tok_ext120 and tok_ext1 <= ctok <= tok_ext120) \
+                    or (tok_ext1 <= etok <= tok_ext120 and etok == ctok):
+                    toks[i, exp_idx[i, 0]] = 0
+                    toks[i, -1] += 1
+
+        if self.oracle_ext != 'none':
+            _fill_frame(tokens, oracle_exts)
 
         # A list that indicates candidates that should be ignored.
         # For example, suppose we're sampling and have already finalized 2/5
@@ -328,6 +423,7 @@ class SequenceGenerator(nn.Module):
 
             lprobs[:, self.pad] = -math.inf  # never select pad
             lprobs[:, self.unk] -= self.unk_penalty  # apply unk penalty
+            lprobs[:, self.abs] -= self.abs_penalty
 
             # handle max length constraint
             if step >= max_len:
@@ -368,6 +464,10 @@ class SequenceGenerator(nn.Module):
 
             if self.no_repeat_ngram_size > 0:
                 lprobs = self._no_repeat_ngram(tokens, lprobs, bsz, beam_size, step)
+
+            # Guangsheng Bao: generate tokens only
+            if self.oracle_ext != 'none':
+                _filter_frame(lprobs, tokens, step)
 
             # Shape: (batch, cand_size)
             cand_scores, cand_indices, cand_beams = self.search.step(
@@ -502,13 +602,17 @@ class SequenceGenerator(nn.Module):
             # copy tokens and scores for active hypotheses
 
             # Set the tokens for each beam (can select the same row more than once)
-            tokens[:, : step + 1] = torch.index_select(
-                tokens[:, : step + 1], dim=0, index=active_bbsz_idx
+            tokens = torch.index_select(
+                tokens, dim=0, index=active_bbsz_idx
             )
             # Select the next token for each of them
             tokens.view(bsz, beam_size, -1)[:, :, step + 1] = torch.gather(
                 cand_indices, dim=1, index=active_hypos
             )
+
+            if self.oracle_ext != 'none':
+                _update_frame(tokens, step + 1)
+
             if step > 0:
                 scores[:, :step] = torch.index_select(
                     scores[:, :step], dim=0, index=active_bbsz_idx
@@ -831,7 +935,7 @@ class EnsembleModel(nn.Module):
 
             attn: Optional[Tensor] = None
             decoder_len = len(decoder_out)
-            if decoder_len > 1 and decoder_out[1] is not None:
+            if False and decoder_len > 1 and decoder_out[1] is not None:
                 if isinstance(decoder_out[1], Tensor):
                     attn = decoder_out[1]
                 else:

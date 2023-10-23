@@ -119,6 +119,7 @@ class Trainer(object):
         self._start_time = time.time()
         self._previous_training_time = 0
         self._cumulative_training_time = None
+        self._cur_epoch = 0
 
     def reinitialize(self):
         """Reinitialize the Trainer, typically after model params change."""
@@ -262,6 +263,33 @@ class Trainer(object):
                 self._optim_history,
                 extra_state,
             )
+
+    def _freeze_parameters(self, epoch):
+        if self.args.freeze_pretrain <= 0:
+            return  # skip
+
+        if epoch == 1:  # freeze pretrained parameters
+            keys_skip = ['.embed_sents.', '.embed_tags.', '.alpha_out']
+            for name, param in self.model.named_parameters():
+                skip = any(name.find(key) > 0 for key in keys_skip)
+                if skip or not param.requires_grad:
+                    logger.info(f'Kept: {name}')
+                else:
+                    param.requires_grad = False
+                    logger.info(f'Freezed: {name}')
+        elif epoch == self.args.freeze_pretrain + 1:
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    param.requires_grad = True
+                    logger.info(f'Unfreeze: {name}')
+                else:
+                    logger.info(f'Kept: {name}')
+        else:
+            return  # skip
+
+        # reset optimizer
+        self._build_optimizer()
+        self.set_num_updates(0)
 
     def load_checkpoint(
         self,
@@ -412,6 +440,10 @@ class Trainer(object):
         """Called at the beginning of each epoch."""
         logger.info("begin training epoch {}".format(epoch))
 
+        self._cur_epoch = epoch
+
+        self._freeze_parameters(epoch)
+
         self.lr_step_begin_epoch(epoch)
 
         if self.quantizer is not None:
@@ -473,6 +505,9 @@ class Trainer(object):
                     return self.model.no_sync()
                 else:
                     return contextlib.ExitStack()  # dummy contextmanager
+
+            # Guangsheng Bao: pass current epoch to loss class
+            sample['in-freeze-pretrain'] = self._cur_epoch <= self.args.freeze_pretrain
 
             try:
                 with maybe_no_sync():

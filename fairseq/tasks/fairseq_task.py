@@ -5,6 +5,7 @@
 
 import logging
 import os
+import numpy as np
 import warnings
 from argparse import Namespace
 
@@ -378,6 +379,8 @@ class FairseqTask(object):
             max_len_b=getattr(args, "max_len_b", 200),
             min_len=getattr(args, "min_len", 1),
             normalize_scores=(not getattr(args, "unnormalized", False)),
+            oracle_ext=getattr(args, "oracle_ext", 'none'),
+            abs_penalty=getattr(args, "abspen", 1),
             len_penalty=getattr(args, "lenpen", 1),
             unk_penalty=getattr(args, "unkpen", 0),
             temperature=getattr(args, "temperature", 1.0),

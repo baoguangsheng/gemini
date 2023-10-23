@@ -3,11 +3,14 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
 from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from fairseq import utils
 from fairseq.models import (
     FairseqEncoder,
@@ -22,6 +25,7 @@ from fairseq.modules import (
     FairseqDropout,
     LayerDropModuleList,
     LayerNorm,
+    GradMultiply,
     PositionalEmbedding,
     SinusoidalPositionalEmbedding,
     TransformerDecoderLayer,
@@ -35,8 +39,8 @@ DEFAULT_MAX_SOURCE_POSITIONS = 1024
 DEFAULT_MAX_TARGET_POSITIONS = 1024
 
 
-@register_model("transformer")
-class TransformerModel(FairseqEncoderDecoderModel):
+@register_model("transformer_gemini")
+class GeminiTransformerModel(FairseqEncoderDecoderModel):
     """
     Transformer model from `"Attention Is All You Need" (Vaswani, et al, 2017)
     <https://arxiv.org/abs/1706.03762>`_.
@@ -173,6 +177,10 @@ class TransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument('--quant-noise-scalar', type=float, metavar='D', default=0,
                             help='scalar quantization noise and scalar quantization at training time')
         # fmt: on
+        parser.add_argument('--lrscale-randinit', type=float, default=1.0,
+                            help='lr scale for randomly initialized parameters')
+        parser.add_argument('--freeze-pretrain', type=int, default=0,
+                            help='lr scale for randomly initialized parameters')
 
     @classmethod
     def build_model(cls, args, task):
@@ -219,13 +227,29 @@ class TransformerModel(FairseqEncoderDecoderModel):
                 args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
             )
 
-        encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
-        decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
+        # Guangsheng Bao: add embedding table for group tags and sentence pointers
+        tag_general = src_dict.index('<S>')
+        tag_end = src_dict.index('</S>')
+        embed_sents = cls.build_sent_embedding(args, tag_end - tag_general + 1, args.encoder_embed_dim)
+        embed_tags = cls.build_tag_embedding(args, tag_end - tag_general + 1, args.encoder_embed_dim)
+        encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens, embed_sents, embed_tags)
+        decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens, embed_sents, embed_tags)
         return cls(args, encoder, decoder)
 
     @classmethod
+    def build_tag_embedding(cls, args, num_embeddings, embed_dim):
+        padding_idx = 0
+        return Embedding(num_embeddings, embed_dim, padding_idx)
+
+    @classmethod
+    def build_sent_embedding(cls, args, num_embeddings, embed_dim):
+        padding_idx = None  # no padding embedding
+        return Embedding(num_embeddings, embed_dim, padding_idx)
+
+    @classmethod
     def build_embedding(cls, args, dictionary, embed_dim, path=None):
-        num_embeddings = len(dictionary)
+        # Guangsheng Bao: keep the size of embedding table of pretrained model
+        num_embeddings = dictionary.index('<S>')
         padding_idx = dictionary.pad()
 
         emb = Embedding(num_embeddings, embed_dim, padding_idx)
@@ -236,17 +260,39 @@ class TransformerModel(FairseqEncoderDecoderModel):
         return emb
 
     @classmethod
-    def build_encoder(cls, args, src_dict, embed_tokens):
-        return TransformerEncoder(args, src_dict, embed_tokens)
+    def build_encoder(cls, args, src_dict, embed_tokens, embed_sents, embed_tags):
+        return TransformerEncoder(args, src_dict, embed_tokens, embed_sents, embed_tags)
 
     @classmethod
-    def build_decoder(cls, args, tgt_dict, embed_tokens):
+    def build_decoder(cls, args, tgt_dict, embed_tokens, embed_sents, embed_tags):
         return TransformerDecoder(
             args,
             tgt_dict,
             embed_tokens,
+            embed_sents,
+            embed_tags,
             no_encoder_attn=getattr(args, "no_cross_attention", False),
         )
+
+    # Guangsheng Bao: extend token table to include tokens for group tag
+    def upgrade_state_dict_named(self, state_dict, name):
+        def _clone(key, embed, k=1):
+            newemb = embed.clone().cpu() * k
+            logging.warning(f'Clone from model: {key}.')
+            return newemb
+
+        keys_randinit = ['.embed_sents.', '.embed_tags.', '.alpha_out']
+        for nm, param in self.encoder.named_parameters('encoder'):
+            is_randinit = any(nm.find(key) > 0 for key in keys_randinit)
+            if is_randinit and nm not in state_dict:
+                state_dict[nm] = _clone(nm, param, k=0.1 if nm.find('.embed_') > 0 else 1)
+
+        for nm, param in self.decoder.named_parameters('decoder'):
+            is_randinit = any(nm.find(key) > 0 for key in keys_randinit)
+            if is_randinit and nm not in state_dict:
+                state_dict[nm] = _clone(nm, param, k=0.1 if nm.find('.embed_') > 0 else 1)
+
+        super().upgrade_state_dict_named(state_dict, name)
 
     # TorchScript doesn't support optional arguments with variable length (**kwargs).
     # Current workaround is to add union of all arguments in child classes.
@@ -305,7 +351,7 @@ class TransformerEncoder(FairseqEncoder):
         embed_tokens (torch.nn.Embedding): input embedding
     """
 
-    def __init__(self, args, dictionary, embed_tokens):
+    def __init__(self, args, dictionary, embed_tokens, embed_sents, embed_tags):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
 
@@ -319,6 +365,9 @@ class TransformerEncoder(FairseqEncoder):
         self.max_source_positions = args.max_source_positions
 
         self.embed_tokens = embed_tokens
+        self.embed_sents = embed_sents
+        self.embed_tags = embed_tags
+        self.lrscale_randinit = args.lrscale_randinit
 
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
 
@@ -364,21 +413,69 @@ class TransformerEncoder(FairseqEncoder):
     def build_encoder_layer(self, args):
         return TransformerEncoderLayer(args)
 
+    # Guangsheng Bao: separate tokens and group tags for encoder
+    def separate_grouptags(self, tokens):
+        tag_general = self.dictionary.index('<S>')
+        tag_start = self.dictionary.index('<S1>')
+        tag_end = self.dictionary.index('</S>')
+
+        def _toks_to_tags(tokens):
+            tags = []
+            tag = []
+            for tok in tokens:
+                if tok == tag_general:
+                    # tag.append(1)
+                    tags.append(tag)
+                elif tag_start <= tok < tag_end:
+                    tag.append(tok - tag_start + 2)
+                    tags.append(tag)
+                elif tok == tag_end:
+                    tags.append(tag)
+                    tag = tag[:-1]
+                else:
+                    tags.append(tag)
+            return tags
+
+        newtokens = tokens
+        grouptags = [_toks_to_tags(tokens) for tokens in tokens.data.cpu().numpy().tolist()]
+
+        # Group tag embeddings: handle multiple group tags on one token
+        max_numtag = max(max(len(tag) for tag in tags) for tags in grouptags)
+        tag_embedding = None
+        for i in range(max_numtag):
+            single_tags = [[tag[i] if i < len(tag) else 0 for tag in tags] for tags in grouptags]
+            single_tags = torch.tensor(single_tags, dtype=tokens.dtype, device=tokens.device)
+            if tag_embedding is None:
+                tag_embedding = self.embed_tags(single_tags)
+            else:
+                tag_embedding = tag_embedding + self.embed_tags(single_tags)
+        tag_embedding = GradMultiply.apply(tag_embedding, self.lrscale_randinit)
+        return newtokens, tag_embedding
+
+    def _embed_tokens(self, tokens):
+        embed_sents_weight = GradMultiply.apply(self.embed_sents.weight,  self.lrscale_randinit)
+        return F.embedding(tokens, torch.cat([self.embed_tokens.weight, embed_sents_weight], dim=0),
+                           self.embed_tokens.padding_idx)
+
     def forward_embedding(
         self, src_tokens, token_embedding: Optional[torch.Tensor] = None
     ):
+        src_tokens, grouptag_embedding = self.separate_grouptags(src_tokens)
         # embed tokens and positions
         if token_embedding is None:
-            token_embedding = self.embed_tokens(src_tokens)
+            token_embedding = self._embed_tokens(src_tokens)
         x = embed = self.embed_scale * token_embedding
+        # Guangsheng Bao: apply group tag embeddings
+        if grouptag_embedding is not None:
+            x = x + grouptag_embedding
         if self.embed_positions is not None:
-            x = embed + self.embed_positions(src_tokens)
+            x = x + self.embed_positions(src_tokens)
         if self.layernorm_embedding is not None:
             x = self.layernorm_embedding(x)
         x = self.dropout_module(x)
         if self.quant_noise is not None:
             x = self.quant_noise(x)
-        return x, embed
+        return x, embed, src_tokens
 
     def forward(
         self,
@@ -410,19 +507,22 @@ class TransformerEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
-        x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
+        x, encoder_embedding, src_tokens = self.forward_embedding(src_tokens, token_embeddings)
 
         # B x T x C -> T x B x C
         x = x.transpose(0, 1)
 
         # compute padding mask
         encoder_padding_mask = src_tokens.eq(self.padding_idx)
+        src_lengths = (1 - encoder_padding_mask.int()).sum(-1)
 
         encoder_states = [] if return_all_hiddens else None
 
         # encoder layers
+        attns = []
         for layer in self.layers:
-            x = layer(x, encoder_padding_mask)
+            x, layer_attn = layer(x, encoder_padding_mask)
+            attns.append(layer_attn)
             if return_all_hiddens:
                 assert encoder_states is not None
                 encoder_states.append(x)
@@ -435,8 +535,8 @@ class TransformerEncoder(FairseqEncoder):
             encoder_padding_mask=encoder_padding_mask,  # B x T
             encoder_embedding=encoder_embedding,  # B x T x C
             encoder_states=encoder_states,  # List[T x B x C]
-            src_tokens=None,
-            src_lengths=None,
+            src_tokens=src_tokens,
+            src_lengths=src_lengths,
         )
 
     @torch.jit.export
@@ -540,7 +640,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             (default: False).
     """
 
-    def __init__(self, args, dictionary, embed_tokens, no_encoder_attn=False):
+    def __init__(self, args, dictionary, embed_tokens, embed_sents, embed_tags, no_encoder_attn=False):
         self.args = args
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
@@ -561,6 +661,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.max_target_positions = args.max_target_positions
 
         self.embed_tokens = embed_tokens
+        self.embed_sents = embed_sents
+        self.embed_tags = embed_tags
+        self.lrscale_randinit = args.lrscale_randinit
+        self.alpha_out = nn.Parameter(torch.tensor(0.0))
 
         self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
 
@@ -635,12 +739,14 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 tie_proj=args.tie_adaptive_proj,
             )
         elif self.share_input_output_embed:
-            self.output_projection = nn.Linear(
-                self.embed_tokens.weight.shape[1],
-                self.embed_tokens.weight.shape[0],
-                bias=False,
-            )
-            self.output_projection.weight = self.embed_tokens.weight
+            # Guangsheng Bao: dynamically build projection matrix instead of predefined one.
+            self.output_projection = None
+            # self.output_projection = nn.Linear(
+            #     self.embed_tokens.weight.shape[1],
+            #     self.embed_tokens.weight.shape[0],
+            #     bias=False,
+            # )
+            # self.output_projection.weight = self.embed_tokens.weight
         else:
             self.output_projection = nn.Linear(
                 self.output_embed_dim, len(dictionary), bias=False
@@ -651,6 +757,41 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
     def build_decoder_layer(self, args, no_encoder_attn=False):
         return TransformerDecoderLayer(args, no_encoder_attn)
+
+    def separate_grouptags(self, tokens):
+        tag_general = self.dictionary.index('<S>')
+        tag_start = self.dictionary.index('<S1>')
+        tag_end = self.dictionary.index('</S>')
+
+        def _toks_to_tags(tokens):
+            tags = []
+            tag = 0
+            for tok in tokens:
+                if tok == tag_general:
+                    tag = 0
+                    tags.append(tag)
+                elif tag_start <= tok < tag_end:
+                    tag = tok - tag_start + 2
+                    tags.append(tag)
+                elif tok == tag_end:
+                    tags.append(tag)
+                    tag = 0
+                else:
+                    tags.append(tag)
+            return tags
+
+        newtokens = tokens
+        grouptags = [_toks_to_tags(tokens) for tokens in tokens.data.cpu().numpy().tolist()]
+        grouptags = torch.tensor(grouptags, dtype=tokens.dtype, device=tokens.device)
+        return newtokens, grouptags
+
+    def _embed_tokens(self, tokens):
+        embed_sents_weight = GradMultiply.apply(self.embed_sents.weight,  self.lrscale_randinit)
+        return F.embedding(tokens, torch.cat([self.embed_tokens.weight, embed_sents_weight], dim=0),
+                           self.embed_tokens.padding_idx)
+
+    def _embed_tags(self, tags):
+        return GradMultiply.apply(self.embed_tags(tags),  self.lrscale_randinit)
 
     def forward(
         self,
@@ -691,7 +832,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             alignment_heads=alignment_heads,
         )
         if not features_only:
-            x = self.output_layer(x)
+            x = self.output_layer(x, prev_output_tokens, encoder_out)
         return x, extra
 
     def extract_features(
@@ -746,8 +887,11 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 - the decoder's features of shape `(batch, tgt_len, embed_dim)`
                 - a dictionary with any model-specific outputs
         """
-        if alignment_layer is None:
-            alignment_layer = self.num_layers - 1
+        # Guangsheng Bao: group tags on decoder side
+        prev_output_tokens, prev_output_tags = self.separate_grouptags(prev_output_tokens)
+        attn_probe = None
+        if incremental_state is None:
+            attn_probe = CrossAttnProbe(self.dictionary, encoder_out.src_tokens, prev_output_tokens)
 
         # embed positions
         positions = (
@@ -760,11 +904,13 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
         if incremental_state is not None:
             prev_output_tokens = prev_output_tokens[:, -1:]
+            prev_output_tags = prev_output_tags[:, -1:]
             if positions is not None:
                 positions = positions[:, -1:]
 
         # embed tokens and positions
-        x = self.embed_scale * self.embed_tokens(prev_output_tokens)
+        x = self.embed_scale * self._embed_tokens(prev_output_tokens)
+        x = x + self._embed_tags(prev_output_tags)
 
         if self.quant_noise is not None:
             x = self.quant_noise(x)
@@ -788,7 +934,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
 
         # decoder layers
-        attn: Optional[Tensor] = None
         inner_states: List[Optional[Tensor]] = [x]
         for idx, layer in enumerate(self.layers):
             if incremental_state is None and not full_context_alignment:
@@ -803,19 +948,11 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 incremental_state,
                 self_attn_mask=self_attn_mask,
                 self_attn_padding_mask=self_attn_padding_mask,
-                need_attn=bool((idx == alignment_layer)),
-                need_head_weights=bool((idx == alignment_layer)),
+                need_attn=True,
             )
             inner_states.append(x)
-            if layer_attn is not None and idx == alignment_layer:
-                attn = layer_attn.float().to(x)
-
-        if attn is not None:
-            if alignment_heads is not None:
-                attn = attn[:alignment_heads]
-
-            # average probabilities over heads
-            attn = attn.mean(dim=0)
+            if attn_probe:
+                attn_probe.add_cross_attn(idx, layer_attn['decoder_cross'])
 
         if self.layer_norm is not None:
             x = self.layer_norm(x)
@@ -826,15 +963,53 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
 
-        return x, {"attn": [attn], "inner_states": inner_states}
+        # Guangsheng Bao: calculate attentions
+        extra = {"inner_states": inner_states, "cross_ent": False}
+        if attn_probe is not None and not self.training:
+            extra["cross_ent"] = True
+            extra["cross_ent_token"] = attn_probe.entropy_token()
+            extra["cross_ent_sent"] = attn_probe.entropy_sent()
+            # attn_probe.heatmap_token()
+        return x, extra
 
-    def output_layer(self, features):
-        """Project features to the vocabulary size."""
-        if self.adaptive_softmax is None:
-            # project back to size of vocabulary
-            return self.output_projection(features)
-        else:
-            return features
+    # Guangsheng Bao: pointer-rewriter output projection
+    # project back to size of vocabulary
+    def output_layer(self, features, prev_output_tokens, encoder_out):
+        tag_general = self.dictionary.index('<S>')
+        tag_end = self.dictionary.index('</S>')
+        batch_size = features.shape[0]
+        output_length = features.shape[1]
+
+        # distribution for selecting a source sentence for rewriting
+        src_embeds = encoder_out.encoder_out.transpose(0, 1) * self.alpha_out \
+                     + encoder_out.encoder_embedding * (1 - self.alpha_out)
+        mask_tokens = (encoder_out.src_tokens >= self.dictionary.nspecial) \
+                      & ((encoder_out.src_tokens < tag_general) | (encoder_out.src_tokens >= tag_end))
+        attn_logits = torch.matmul(features, src_embeds.transpose(1, 2)).float()
+        attn_logits.masked_fill_(mask_tokens.unsqueeze(1), -1e8)
+
+        # Scatter attention distributions to distributions over the extended
+        # vocabulary in a tensor of shape [batch_size, output_length,
+        # vocab_size]. Each attention weight will be written into a location
+        # that is for other dimensions the same as in the index tensor, but for
+        # the third dimension it's the value of the index tensor (the token ID).
+        src_length = encoder_out.src_tokens.size(1)
+        index = encoder_out.src_tokens[:, None, :]
+        index = index.expand(batch_size, output_length, src_length)
+        sent_logits_size = (batch_size, output_length, len(self.dictionary))
+        sent_logits = attn_logits.new_full(sent_logits_size, -1e8)
+        sent_logits.scatter_(2, index, attn_logits)
+
+        # rewriting/generating token distribution
+        embed_sents_weight = GradMultiply.apply(self.embed_sents.weight, self.lrscale_randinit)
+        weight = torch.cat([self.embed_tokens.weight, embed_sents_weight], dim=0)
+        dec_logits = F.linear(features, weight).float()
+        dec_logits[:, :, tag_general:tag_end] = -1e8
+
+        # merge pointing and decoding distributions
+        mask_sent = (prev_output_tokens == tag_end) | (prev_output_tokens == self.dictionary.eos_index)
+        logits = torch.where(mask_sent.unsqueeze(2), sent_logits, dec_logits)
+        return logits
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
@@ -866,17 +1041,18 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 "{}.embed_positions._float_tensor".format(name)
             ] = torch.FloatTensor(1)
 
-        if f"{name}.output_projection.weight" not in state_dict:
-            if self.share_input_output_embed:
-                embed_out_key = f"{name}.embed_tokens.weight"
-            else:
-                embed_out_key = f"{name}.embed_out"
-            if embed_out_key in state_dict:
-                state_dict[f"{name}.output_projection.weight"] = state_dict[
-                    embed_out_key
-                ]
-                if not self.share_input_output_embed:
-                    del state_dict[embed_out_key]
+        # Guangsheng Bao: dynamically build projection matrix instead of predefined one.
+        # if f"{name}.output_projection.weight" not in state_dict:
+        #     if self.share_input_output_embed:
+        #         embed_out_key = f"{name}.embed_tokens.weight"
+        #     else:
+        #         embed_out_key = f"{name}.embed_out"
+        #     if embed_out_key in state_dict:
+        #         state_dict[f"{name}.output_projection.weight"] = state_dict[
+        #             embed_out_key
+        #         ]
+        #         if not self.share_input_output_embed:
+        #             del state_dict[embed_out_key]
 
         for i in range(self.num_layers):
             # update layer norms
@@ -902,7 +1078,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             state_dict[version_key] = torch.Tensor([1])
 
         return state_dict
-
 
 def Embedding(num_embeddings, embedding_dim, padding_idx):
     m = nn.Embedding(num_embeddings, embedding_dim, padding_idx=padding_idx)

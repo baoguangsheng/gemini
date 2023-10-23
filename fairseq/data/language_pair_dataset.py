@@ -297,6 +297,9 @@ class LanguagePairDataset(FairseqDataset):
         else:
             self.buckets = None
         self.pad_to_multiple = pad_to_multiple
+        # Guangsheng Bao: count rewriting sentence which is not found in source
+        self.total = 0
+        self.unfound = 0
 
     def get_batch_shapes(self):
         return self.buckets
@@ -304,6 +307,18 @@ class LanguagePairDataset(FairseqDataset):
     def __getitem__(self, index):
         tgt_item = self.tgt[index] if self.tgt is not None else None
         src_item = self.src[index]
+
+        # Guangsheng Bao: make sure that all the rewriting sentences in target exist in source
+        tag_general = self.tgt_dict.index('<S>')
+        tag_end = self.tgt_dict.index('</S>')
+        src_sents = [tok for tok in src_item.data.numpy().tolist() if tag_general < tok < tag_end]
+        tgt_new = [(tok if tok in src_sents else tag_general) if tag_general < tok < tag_end else tok
+                   for tok in tgt_item.data.numpy().tolist()]
+        tgt_new = tgt_item.new_tensor(tgt_new)
+        self.unfound += (tgt_new != tgt_item).int().sum()
+        self.total += ((tgt_item > tag_general) & (tgt_item < tag_end)).int().sum()
+        tgt_item = tgt_new
+
         # Append EOS to end of tgt sentence if it does not have an EOS and remove
         # EOS from end of src sentence if it exists. This is useful when we use
         # use existing datasets for opposite directions i.e., when we want to

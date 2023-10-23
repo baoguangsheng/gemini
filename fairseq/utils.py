@@ -699,3 +699,16 @@ def eval_bool(x, default=False):
         return bool(eval(x))
     except TypeError:
         return default
+
+# Guangsheng Bao: helper methods for attention distribution
+def attn_entropy(attn, mean_dim=None):
+    with torch.no_grad():
+        attn_log = torch.where(attn > 0, torch.log(attn.detach()), torch.zeros_like(attn))
+        entropy = -(attn * attn_log).sum(dim=-1)
+        if mean_dim is not None:
+            entropy = entropy.mean(dim=mean_dim)
+        return entropy
+
+def average_layers_ent(entropies):
+    ents = torch.stack(entropies, dim=0)
+    return ents.mean(dim=0)
