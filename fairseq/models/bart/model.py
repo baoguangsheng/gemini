@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from fairseq import utils
 from fairseq.models import register_model, register_model_architecture
-from fairseq.models.transformer import TransformerModel
+from fairseq.models.transformer_gemini import GeminiTransformerModel
 from fairseq.modules.transformer_sentence_encoder import init_bert_params
 
 from .hub_interface import BARTHubInterface
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 @register_model("bart")
-class BARTModel(TransformerModel):
+class BARTModel(GeminiTransformerModel):
     @classmethod
     def hub_models(cls):
         return {
