@@ -30,9 +30,11 @@ CUDA_VISIBLE_DEVICES=0 bash scripts_sum/test-rewriter.sh cnndm exp_root
 ### Citation
 If you find this work useful, you can cite it with the following BibTex entry:
 
-    @article{bao2023gemini,
-      title={GEMINI: Controlling the Sentence-level Writing Style for Abstractive Text Summarization},
+    @inproceedings{bao2023gemini,
+      title={GEMINI: Controlling The Sentence-Level Summary Style in Abstractive Text Summarization},
       author={Bao, Guangsheng and Ou, Zebin and Zhang, Yue},
-      journal={arXiv preprint arXiv:2304.03548},
+      booktitle={Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing},
+      pages={831--842},
       year={2023}
     }
+
