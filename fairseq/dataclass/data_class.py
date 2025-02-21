@@ -571,7 +571,7 @@ class EvalLMParams(FairseqDataclass):
 class TrainingConfig(FairseqDataclass):
     """Config for training, a composition of training params"""
 
-    common: CommonParams = CommonParams()
+    common: CommonParams = field(default_factory=CommonParams)
     distributed_training: DistributedTrainingParams = DistributedTrainingParams()
     dataset: DatasetParams = DatasetParams()
     optimization: OptimizationParams = OptimizationParams()
@@ -583,7 +583,7 @@ class TrainingConfig(FairseqDataclass):
 class EvalLMConfig(FairseqDataclass):
     """Config for eval lm, a composition of eval_lm params"""
 
-    common: CommonParams = CommonParams()
+    common: CommonParams = field(default_factory=CommonParams)
     distributed_training: DistributedTrainingParams = DistributedTrainingParams()
     dataset: DatasetParams = DatasetParams()
     optimization: OptimizationParams = OptimizationParams()
